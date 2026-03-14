@@ -1,27 +1,31 @@
 import type { Metadata } from 'next';
-import Link from 'next/link';
+import { Suspense } from 'react';
 import './globals.css';
+import { TopNav } from '@/app/components/TopNav';
+import { listProjects } from '@/lib/projects';
 
 export const metadata: Metadata = {
-  title: 'OpenSpec Approvals',
-  description: 'Review OpenSpec artifacts with searchable dashboard and approvals.',
+  title: 'OpenSpec Review',
+  description: 'Review OpenSpec spec documents with inline comments and approval decisions.',
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }): React.ReactElement {
+  const projects = listProjects().map((project) => ({ id: project.id, name: project.name }));
+
   return (
     <html lang="en">
       <body>
-        <header className="topbar">
-          <div className="topbar-inner">
-            <Link href="/" className="brand">
-              OpenSpec Approvals
-            </Link>
-            <nav className="nav">
-              <Link href="/">Changes</Link>
-              <Link href="/search">Search</Link>
-            </nav>
-          </div>
-        </header>
+        <Suspense
+          fallback={
+            <header className="topbar">
+              <div className="topbar-inner">
+                <span className="brand">OpenSpec Review</span>
+              </div>
+            </header>
+          }
+        >
+          <TopNav projects={projects} />
+        </Suspense>
         <main>{children}</main>
       </body>
     </html>

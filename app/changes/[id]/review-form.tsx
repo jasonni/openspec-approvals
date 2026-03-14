@@ -3,9 +3,11 @@
 import { useState } from 'react';
 
 export function ApprovalForm({
+  projectId,
   changeId,
   artifactType,
 }: {
+  projectId: string;
   changeId: string;
   artifactType: 'proposal' | 'design' | 'tasks' | 'spec';
 }): React.ReactElement {
@@ -21,7 +23,7 @@ export function ApprovalForm({
     const res = await fetch('/api/approvals', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ changeId, artifactType, decision, comment, reviewer }),
+      body: JSON.stringify({ projectId, changeId, artifactType, decision, comment, reviewer }),
     });
 
     if (!res.ok) {

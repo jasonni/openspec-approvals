@@ -1,10 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import chokidar from 'chokidar';
-import { config } from '@/lib/config';
-import { upsertDocument, clearDocumentsForChange, replaceAllDocuments } from '@/lib/db';
+import chokidar, { type FSWatcher } from 'chokidar';
+import { clearDocumentsForChange, replaceAllDocuments, upsertDocument } from '@/lib/db';
 import { embed } from '@/lib/embed';
-import { events } from '@/lib/events';
+import { emitStreamEvent } from '@/lib/events';
+import { requireProject } from '@/lib/projects';
 import type { Artifact, ArtifactType, ChangeDetail, ChangeSummary } from '@/lib/types';
 
 const ARTIFACT_FILES: Array<{ type: ArtifactType; filename: string }> = [
@@ -13,7 +13,12 @@ const ARTIFACT_FILES: Array<{ type: ArtifactType; filename: string }> = [
   { type: 'tasks', filename: 'tasks.md' },
 ];
 
-const globalState = globalThis as unknown as { watcherStarted?: boolean };
+const CHANGE_ID_RE = /^[A-Za-z0-9._-]+$/;
+
+const globalState = globalThis as unknown as {
+  watchers?: Map<string, FSWatcher>;
+  reindexTimers?: Map<string, NodeJS.Timeout>;
+};
 
 function readFileSafe(filePath: string): string {
   try {
@@ -50,10 +55,6 @@ function findSpecFiles(specDir: string): string[] {
   return out;
 }
 
-function toChangeId(changeDir: string): string {
-  return path.basename(changeDir);
-}
-
 function collectArtifacts(changeDir: string): Artifact[] {
   const artifacts: Artifact[] = [];
   for (const { type, filename } of ARTIFACT_FILES) {
@@ -73,11 +74,15 @@ function collectArtifacts(changeDir: string): Artifact[] {
   for (const file of specFiles) {
     const content = readFileSafe(file);
     if (!content) continue;
+    // Extract specId from path: specs/<specId>/spec.md
+    const relative = path.relative(specRoot, file);
+    const specId = path.dirname(relative).split(path.sep)[0] || path.basename(path.dirname(file));
     artifacts.push({
       type: 'spec',
       path: file,
       content,
       headings: headingsFromMarkdown(content),
+      specId,
     });
   }
 
@@ -85,7 +90,7 @@ function collectArtifacts(changeDir: string): Artifact[] {
 }
 
 function changeTitle(changeId: string, artifacts: Artifact[]): string {
-  const proposal = artifacts.find((a) => a.type === 'proposal');
+  const proposal = artifacts.find((artifact) => artifact.type === 'proposal');
   if (!proposal) return changeId;
   const h1 = proposal.content
     .split('\n')
@@ -95,8 +100,21 @@ function changeTitle(changeId: string, artifacts: Artifact[]): string {
   return h1 || changeId;
 }
 
-export function listChanges(): ChangeSummary[] {
-  const changesDir = path.join(config.openspecRoot, 'changes');
+function changesDirForProject(projectId: string): string {
+  const project = requireProject(projectId);
+  return path.join(project.openspecRoot, 'changes');
+}
+
+function resolveChangeDir(projectId: string, changeId: string): string | null {
+  if (!CHANGE_ID_RE.test(changeId)) return null;
+  const base = path.resolve(changesDirForProject(projectId));
+  const resolved = path.resolve(base, changeId);
+  if (resolved === base || !resolved.startsWith(`${base}${path.sep}`)) return null;
+  return resolved;
+}
+
+export function listChanges(projectId: string): ChangeSummary[] {
+  const changesDir = changesDirForProject(projectId);
   if (!fs.existsSync(changesDir)) return [];
 
   const out: ChangeSummary[] = [];
@@ -104,9 +122,12 @@ export function listChanges(): ChangeSummary[] {
     if (!entry.isDirectory()) continue;
     const id = entry.name;
     if (id === 'archive') continue;
-    const abs = path.join(changesDir, id);
-    const artifacts = collectArtifacts(abs);
+    if (!CHANGE_ID_RE.test(id)) continue;
 
+    const abs = resolveChangeDir(projectId, id);
+    if (!abs) continue;
+
+    const artifacts = collectArtifacts(abs);
     let updatedAt = new Date(0);
     for (const artifact of artifacts) {
       const stat = fs.statSync(artifact.path);
@@ -114,6 +135,7 @@ export function listChanges(): ChangeSummary[] {
     }
 
     out.push({
+      projectId,
       id,
       title: changeTitle(id, artifacts),
       path: abs,
@@ -125,9 +147,10 @@ export function listChanges(): ChangeSummary[] {
   return out.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
-export function getChangeDetail(changeId: string): ChangeDetail | null {
-  const changeDir = path.join(config.openspecRoot, 'changes', changeId);
-  if (!fs.existsSync(changeDir)) return null;
+export function getChangeDetail(projectId: string, changeId: string): ChangeDetail | null {
+  const changeDir = resolveChangeDir(projectId, changeId);
+  if (!changeDir || !fs.existsSync(changeDir)) return null;
+
   const artifacts = collectArtifacts(changeDir);
   let updatedAt = new Date(0);
   for (const artifact of artifacts) {
@@ -136,6 +159,7 @@ export function getChangeDetail(changeId: string): ChangeDetail | null {
   }
 
   return {
+    projectId,
     id: changeId,
     title: changeTitle(changeId, artifacts),
     path: changeDir,
@@ -145,15 +169,16 @@ export function getChangeDetail(changeId: string): ChangeDetail | null {
   };
 }
 
-export function reindexAll(): number {
-  const changes = listChanges();
+export function reindexAll(projectId: string): number {
+  const changes = listChanges(projectId);
   for (const change of changes) {
-    clearDocumentsForChange(change.id);
-    const detail = getChangeDetail(change.id);
+    clearDocumentsForChange(projectId, change.id);
+    const detail = getChangeDetail(projectId, change.id);
     if (!detail) continue;
 
     for (const artifact of detail.artifacts) {
       upsertDocument({
+        projectId,
         changeId: detail.id,
         artifactType: artifact.type,
         path: artifact.path,
@@ -164,9 +189,13 @@ export function reindexAll(): number {
     }
   }
 
-  replaceAllDocuments(changes.map((c) => ({ changeId: c.id })));
+  replaceAllDocuments(
+    projectId,
+    changes.map((change) => ({ changeId: change.id }))
+  );
 
-  events.emit('stream', {
+  emitStreamEvent({
+    projectId,
     type: 'indexed',
     message: `Indexed ${changes.length} changes`,
     payload: { count: changes.length },
@@ -175,14 +204,29 @@ export function reindexAll(): number {
   return changes.length;
 }
 
-export function startWatcher(): void {
-  if (globalState.watcherStarted) return;
-  globalState.watcherStarted = true;
-
-  const target = path.join(config.openspecRoot, 'changes');
-  if (!fs.existsSync(target)) {
-    return;
+function scheduleReindex(projectId: string): void {
+  if (!globalState.reindexTimers) {
+    globalState.reindexTimers = new Map();
   }
+  const previous = globalState.reindexTimers.get(projectId);
+  if (previous) {
+    clearTimeout(previous);
+  }
+  const timer = setTimeout(() => {
+    reindexAll(projectId);
+    globalState.reindexTimers?.delete(projectId);
+  }, 150);
+  globalState.reindexTimers.set(projectId, timer);
+}
+
+export function startWatcher(projectId: string): void {
+  if (!globalState.watchers) {
+    globalState.watchers = new Map();
+  }
+  if (globalState.watchers.has(projectId)) return;
+
+  const target = changesDirForProject(projectId);
+  if (!fs.existsSync(target)) return;
 
   const watcher = chokidar.watch(target, {
     ignoreInitial: true,
@@ -192,8 +236,14 @@ export function startWatcher(): void {
     },
   });
 
-  const handle = () => {
-    reindexAll();
+  const handle = (changedPath: string) => {
+    emitStreamEvent({
+      projectId,
+      type: 'artifact_updated',
+      message: `Detected change in ${path.basename(changedPath)}`,
+      payload: { path: changedPath },
+    });
+    scheduleReindex(projectId);
   };
 
   watcher.on('add', handle);
@@ -201,4 +251,6 @@ export function startWatcher(): void {
   watcher.on('unlink', handle);
   watcher.on('addDir', handle);
   watcher.on('unlinkDir', handle);
+
+  globalState.watchers.set(projectId, watcher);
 }

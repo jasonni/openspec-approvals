@@ -1,0 +1,38 @@
+schema: spec-driven
+
+# Project context (optional)
+# This is shown to AI when creating artifacts.
+# Add your tech stack, conventions, style guides, domain knowledge, etc.
+# Example:
+#   context: |
+#     Tech stack: TypeScript, React, Node.js
+#     We use conventional commits
+#     Domain: e-commerce platform
+
+context: |
+  所有文件請使用繁體中文（Traditional Chinese, zh-TW）撰寫
+  Tech stack: TypeScript, React, Next.js, Node.js
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+# Example:
+#   rules:
+#     proposal:
+#       - Keep proposals under 500 words
+#       - Always include a "Non-goals" section
+#     tasks:
+#       - Break tasks into chunks of max 2 hours
+
+rules:
+  proposal:
+    - 使用繁體中文撰寫所有內容
+    - 保持提案簡潔明瞭
+  design:
+    - 使用繁體中文說明設計細節
+    - 包含清晰的架構圖說明
+  tasks:
+    - 使用繁體中文描述任務
+    - 將任務拆分成合理的執行單位
+  spec:
+    - 使用繁體中文撰寫規格說明
+    - 確保技術術語保持一致性

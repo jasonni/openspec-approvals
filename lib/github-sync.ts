@@ -1,4 +1,4 @@
-import { config, githubEnabled } from '@/lib/config';
+import { approvalFilePath, getProject, projectGithubEnabled } from '@/lib/projects';
 import {
   listApprovals,
   listPendingSyncJobs,
@@ -6,7 +6,7 @@ import {
   markApprovalsSynced,
   updateSyncJob,
 } from '@/lib/db';
-import { events } from '@/lib/events';
+import { emitStreamEvent } from '@/lib/events';
 
 const globalWorker = globalThis as unknown as { processingSync?: boolean };
 
@@ -16,12 +16,20 @@ type GithubContentResponse = {
   message?: string;
 };
 
-async function githubRequest<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`https://api.github.com${path}`, {
+async function githubRequest<T>(projectId: string, apiPath: string, init?: RequestInit): Promise<T> {
+  const project = getProject(projectId);
+  if (!project) {
+    throw new Error(`Unknown project for sync: ${projectId}`);
+  }
+  if (!projectGithubEnabled(project)) {
+    throw new Error(`GitHub sync is not configured for project: ${projectId}`);
+  }
+
+  const res = await fetch(`https://api.github.com${apiPath}`, {
     ...init,
     headers: {
       Accept: 'application/vnd.github+json',
-      Authorization: `Bearer ${config.githubToken}`,
+      Authorization: `Bearer ${project.githubToken}`,
       'X-GitHub-Api-Version': '2022-11-28',
       ...init?.headers,
     },
@@ -34,11 +42,16 @@ async function githubRequest<T>(path: string, init?: RequestInit): Promise<T> {
   return data;
 }
 
-async function readRemoteApprovalFile(changeId: string): Promise<{ sha?: string; events: unknown[] }> {
-  const filePath = `openspec/approvals/${changeId}.json`;
+async function readRemoteApprovalFile(projectId: string, changeId: string): Promise<{ sha?: string; events: unknown[] }> {
+  const project = getProject(projectId);
+  if (!project) {
+    throw new Error(`Unknown project for sync: ${projectId}`);
+  }
+  const filePath = approvalFilePath(project.id, changeId);
   try {
     const data = await githubRequest<GithubContentResponse>(
-      `/repos/${config.githubOwner}/${config.githubRepo}/contents/${encodeURIComponent(filePath)}?ref=${config.githubBranch}`
+      project.id,
+      `/repos/${project.githubOwner}/${project.githubRepo}/contents/${encodeURIComponent(filePath)}?ref=${project.githubBranch}`
     );
     if (!data.content) {
       return { sha: data.sha, events: [] };
@@ -62,23 +75,29 @@ function dedupeEvents(events: Array<{ id: string }>): Array<{ id: string }> {
   return out;
 }
 
-async function syncChangeToGithub(changeId: string): Promise<void> {
-  if (!githubEnabled()) {
-    markApprovalsSynced(changeId);
+async function syncChangeToGithub(projectId: string, changeId: string): Promise<void> {
+  const project = getProject(projectId);
+  if (!project) {
+    throw new Error(`Unknown project for sync: ${projectId}`);
+  }
+
+  if (!projectGithubEnabled(project)) {
+    markApprovalsSynced(projectId, changeId);
     return;
   }
 
-  const localEvents = listApprovals(changeId).map((e) => ({
-    id: e.id,
-    changeId: e.changeId,
-    artifactType: e.artifactType,
-    decision: e.decision,
-    comment: e.comment,
-    reviewer: e.reviewer,
-    createdAt: e.createdAt,
+  const localEvents = listApprovals(projectId, changeId).map((event) => ({
+    id: event.id,
+    projectId: event.projectId,
+    changeId: event.changeId,
+    artifactType: event.artifactType,
+    decision: event.decision,
+    comment: event.comment,
+    reviewer: event.reviewer,
+    createdAt: event.createdAt,
   }));
 
-  const remote = await readRemoteApprovalFile(changeId);
+  const remote = await readRemoteApprovalFile(projectId, changeId);
   const merged = dedupeEvents([
     ...(remote.events as Array<{ id: string; createdAt?: string }>),
     ...localEvents,
@@ -90,26 +109,27 @@ async function syncChangeToGithub(changeId: string): Promise<void> {
 
   const latest = merged.at(-1) as { decision?: string } | undefined;
   const payload = {
+    projectId,
     changeId,
     updatedAt: new Date().toISOString(),
     latestDecision: latest?.decision ?? null,
     events: merged,
   };
 
-  const filePath = `openspec/approvals/${changeId}.json`;
+  const filePath = approvalFilePath(projectId, changeId);
   const content = Buffer.from(`${JSON.stringify(payload, null, 2)}\n`).toString('base64');
 
-  await githubRequest(`/repos/${config.githubOwner}/${config.githubRepo}/contents/${encodeURIComponent(filePath)}`, {
+  await githubRequest(projectId, `/repos/${project.githubOwner}/${project.githubRepo}/contents/${encodeURIComponent(filePath)}`, {
     method: 'PUT',
     body: JSON.stringify({
-      message: `chore(approvals): sync ${changeId}`,
+      message: `chore(approvals): sync ${projectId}/${changeId}`,
       content,
-      branch: config.githubBranch,
+      branch: project.githubBranch,
       sha: remote.sha,
     }),
   });
 
-  markApprovalsSynced(changeId);
+  markApprovalsSynced(projectId, changeId);
 }
 
 export async function processSyncJobs(): Promise<void> {
@@ -120,22 +140,26 @@ export async function processSyncJobs(): Promise<void> {
     const jobs = listPendingSyncJobs(5);
     for (const job of jobs) {
       try {
-        await syncChangeToGithub(job.changeId);
+        await syncChangeToGithub(job.projectId, job.changeId);
         updateSyncJob(job.id, 'done');
-        events.emit('stream', {
+        emitStreamEvent({
+          projectId: job.projectId,
           type: 'sync_status',
           message: `Synced approvals for ${job.changeId}`,
-          payload: { changeId: job.changeId, status: 'synced' },
+          status: 'synced',
+          payload: { projectId: job.projectId, changeId: job.changeId, status: 'synced' },
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         const finalStatus = job.attempts >= 4 ? 'failed' : 'retrying';
         updateSyncJob(job.id, finalStatus, message);
-        markApprovalsFailed(job.changeId);
-        events.emit('stream', {
+        markApprovalsFailed(job.projectId, job.changeId);
+        emitStreamEvent({
+          projectId: job.projectId,
           type: 'sync_status',
           message: `Sync failed for ${job.changeId}`,
-          payload: { changeId: job.changeId, status: finalStatus, error: message },
+          status: finalStatus,
+          payload: { projectId: job.projectId, changeId: job.changeId, status: finalStatus, error: message },
         });
       }
     }

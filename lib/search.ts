@@ -14,8 +14,8 @@ function snippet(content: string, query: string): { text: string; location: numb
   };
 }
 
-export function searchDocuments(query: string, limit = 20): SearchHit[] {
-  const docs = listIndexedDocuments();
+export function searchDocuments(projectId: string, query: string, limit = 20): SearchHit[] {
+  const docs = listIndexedDocuments(projectId);
   if (!query.trim()) return [];
   const qVec = embed(query);
 
@@ -24,6 +24,7 @@ export function searchDocuments(query: string, limit = 20): SearchHit[] {
     const score = cosineSimilarity(qVec, vector);
     const sn = snippet(doc.content, query);
     return {
+      projectId,
       changeId: doc.changeId,
       artifactType: doc.artifactType,
       path: doc.path,
